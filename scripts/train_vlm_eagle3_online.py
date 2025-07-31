@@ -17,7 +17,7 @@ from specforge import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
     OnlineEagle3Model,
-    OnlineEagle3VlmModel,
+    QwenVLOnlineEagle3Model,
 )
 from specforge.data import (
     build_eagle3_dataset,
@@ -234,7 +234,7 @@ def main():
     # build Eagle3 model
     # broadcast draft model
     if args.is_vlm:
-        eagle3_model = OnlineEagle3VlmModel(
+        eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
             draft_model=draft_model,
             processor=processor,

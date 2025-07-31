@@ -21,6 +21,7 @@
 # limitations under the License.
 
 from typing import List, Optional, Tuple
+from abc import abstractmethod
 
 import torch
 import torch.nn as nn
@@ -29,12 +30,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
-
 class Eagle3Model(nn.Module):
     pass
 
-
-class OnlineEagle3Model(Eagle3Model):
+class BaseOnlineEagle3Model(Eagle3Model):
     """
     In sgl-spec, we implement offline/online training.
     Online training means we have the target hidden_states available during training.
@@ -57,6 +56,224 @@ class OnlineEagle3Model(Eagle3Model):
         self.target_model = target_model
         self.draft_model = draft_model
         self.length = length
+    
+    @abstractmethod
+    def _prepare_data(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        device: Optional[torch.device] = None,
+        **kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        pass
+    
+    @abstractmethod
+    def _get_position_ids(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        past_key_values_length: int,
+        seq_length: int,
+        position_ids: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> torch.Tensor:
+        pass
+
+    def _extract_aux_hidden_states(self, outputs) -> torch.Tensor:
+        """
+        Extract the auxiliary hidden states from the target model outputs.
+        """
+        # output_hidden_states = True will return the embedding output as well
+        # so we have an offset of 1
+        num_hidden_states = len(outputs.hidden_states)
+        offset = 1
+        num_layers = num_hidden_states - 1
+
+        # Eagle3 uses 3 aux layers from layer 1, num_layers//2, num_layers-4
+        low_aux_layer = 1 + offset
+        mid_aux_layer = num_layers // 2 - 1 + offset
+        last_aux_layer = num_layers - 4 + offset
+
+        hidden_states0 = outputs.hidden_states[low_aux_layer]
+        hidden_states1 = outputs.hidden_states[mid_aux_layer]
+        hidden_states2 = outputs.hidden_states[last_aux_layer]
+
+        return torch.cat((hidden_states0, hidden_states1, hidden_states2), dim=-1)
+    
+    def ttt_loop(
+        self,
+        hidden_states: torch.Tensor,
+        target: torch.Tensor,
+        loss_mask: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor] = None
+    ):
+        """
+        Run the TTT loop for the draft model.
+        Args:
+            target: (batch, seq_len, vocab_size)
+            loss_mask: (batch, seq_len)
+            input_ids: (batch, seq_len)
+            attention_mask: (batch, seq_len)
+            position_ids: (batch, seq_len)
+            inputs_embeds: (batch, seq_len, hidden_size), optional
+        Returns:
+            plosses: List of losses for each TTT step.
+            vlosses: List of validation losses (not used in this implementation).
+            acces: List of accuracies for each TTT step.
+        """
+        plosses = []
+        vlosses = []
+        acces = []
+        cache_hidden = [[], []]
+        seq_length = hidden_states.shape[1]
+
+        for idx in range(self.length):
+            is_last = idx == self.length - 1
+
+            # embed the input ids
+            if inputs_embeds is not None:
+                inputs_embeds = inputs_embeds
+            else:
+                inputs_embeds = self.draft_model.embed_input_ids(input_ids)
+                inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+
+
+            # run the draft model backbone
+            hidden_states_out = self.draft_model.backbone(
+                input_embeds=inputs_embeds,
+                hidden_states=hidden_states,
+                cache_hidden=cache_hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=True,
+            )
+
+            # handle vocab size
+            with torch.no_grad():
+                target_head = target
+                target_max_token = target_head.argmax(-1)
+                target_mask = self.draft_model.t2d[target_max_token]
+                target_mask = target_mask[..., None].int()
+                position_mask = target_mask * loss_mask
+                target_head = target_head[..., self.draft_model.t2d]
+                target_head = target_head.float()
+                target_p = nn.Softmax(dim=2)(target_head)
+                target_p = target_p.detach()
+
+            # update hidden states for next step
+            hidden_states = hidden_states_out
+
+            # get logits
+            logits = self.draft_model.compute_logits(hidden_states_out)
+            logits = logits.float()
+
+            # calculate loss
+            out_logp = nn.LogSoftmax(dim=2)(logits)
+            plogp = target_p * out_logp
+            loss = -torch.sum(position_mask * plogp, 2).mean()
+
+            # record
+            plosses.append(loss)
+            with torch.no_grad():
+                acces.append(
+                    (
+                        (logits.argmax(-1) == target_p.argmax(-1))
+                        * position_mask.squeeze(-1)
+                    )
+                    .sum()
+                    .item()
+                    / (loss_mask.sum().item() + 1e-6)
+                )
+
+            if not is_last:
+                # Step 7: 更新损失掩码
+                input_ids = padding(input_ids, left=False)
+                target = padding(target, left=False)
+                loss_mask = padding(loss_mask, left=False)
+                ind = torch.arange(seq_length, device=attention_mask.device)
+                ind0 = ind[idx:]
+                ind1 = ind[: seq_length - idx]
+                attention_mask[:, :, ind0, ind1] = torch.finfo(attention_mask.dtype).min
+
+        return plosses, vlosses, acces
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Online eagle model trainer, modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L711
+
+        Args:
+            input_ids: (batch, seq_len)
+            attention_mask: (batch, seq_len)
+            loss_mask: (batch, seq_len)
+            past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
+            position_ids: (batch, seq_len)
+        """ 
+        # Step 1: prepare data with the target model
+        hidden_states, target, loss_mask, input_ids, inputs_embeds = self._prepare_data(
+            input_ids, attention_mask, loss_mask, **kwargs
+        )
+
+        # basic info
+        batch_size, seq_length, _ = hidden_states.shape
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
+
+        # Step 2: project the concatenated hidden states to the target hidden size
+        hidden_states = self.draft_model.project_hidden_states(hidden_states)
+
+        # Step 3: process kv cache, position ids and position ids
+        if past_key_values is not None:
+            past_key_values_length = past_key_values[0][0].shape[2]
+            seq_length_with_past = seq_length_with_past + past_key_values_length
+        position_ids = self._get_position_ids(
+            input_ids, attention_mask, hidden_states, 
+            past_key_values_length, seq_length, position_ids, **kwargs
+        )
+
+        # Step 4: handle attention mask
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, seq_length_with_past),
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+        attention_mask = self.draft_model.prepare_decoder_attention_mask(
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            past_key_values_length=past_key_values_length,
+        )
+
+        # Step 5: run TTT
+        return self.ttt_loop(
+            hidden_states, target, loss_mask, input_ids, 
+            attention_mask, position_ids, inputs_embeds
+        )
+
+class OnlineEagle3Model(BaseOnlineEagle3Model):
+
+    def __init__(self, target_model, draft_model: Eagle3DraftModel, length: int = 7):
+        """
+        Args:
+            target_model: the target model to extract hidden states.
+            draft_model: the draft model to be trained.
+            length: TTT length, it means how many turns to unroll during TTT.
+        """
+        super().__init__(target_model, draft_model, length)
 
     @torch.no_grad()
     def _prepare_data(
@@ -81,6 +298,7 @@ class OnlineEagle3Model(Eagle3Model):
             target: (batch, seq_len, vocab_size)
             loss_mask: (batch, seq_len)
             input_ids: (batch, seq_len)
+            inputs_embeds = (batch, seq_len, hidden_size), optional, used for VLM models
         """
 
         if device is None:
@@ -94,24 +312,7 @@ class OnlineEagle3Model(Eagle3Model):
         )
 
         # extract the aux hidden states
-        # output_hidden_states = True will return the embedding output as well
-        # so we have an offset of 1
-        num_hidden_states = len(outputs.hidden_states)
-        offset = 1
-        num_layers = num_hidden_states - 1
-
-        # Eagle3 uses 3 aux layers from layer 1, num_layers//2, num_layers-4
-        low_aux_layer = 1 + offset
-        mid_aux_layer = num_layers // 2 - 1 + offset
-        last_aux_layer = num_layers - 4 + offset
-
-        hidden_states0 = outputs.hidden_states[low_aux_layer]
-        hidden_states1 = outputs.hidden_states[mid_aux_layer]
-        hidden_states2 = outputs.hidden_states[last_aux_layer]
-
-        hidden_states = torch.cat(
-            (hidden_states0, hidden_states1, hidden_states2), dim=-1
-        )
+        hidden_states = self._extract_aux_hidden_states(outputs)
 
         # apply pading
         target = outputs.logits
@@ -123,43 +324,21 @@ class OnlineEagle3Model(Eagle3Model):
             loss_mask = loss_mask[..., None]
             loss_mask = loss_mask.to(device)
 
-        return hidden_states, target, loss_mask, input_ids
+        return hidden_states, target, loss_mask, input_ids, None
 
-    def forward(
+    def _get_position_ids(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        hidden_states: torch.Tensor,
+        past_key_values_length: int,
+        seq_length: int,
         position_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        **kwargs
+    ) -> torch.Tensor:
         """
-        Online eagle model trainer, modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L711
-
-        Args:
-            input_ids: (batch, seq_len)
-            attention_mask: (batch, seq_len)
-            loss_mask: (batch, seq_len)
-            past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
-            position_ids: (batch, seq_len)
+        get position ids
         """
-        # Step 1: prepare data with the target model
-        hidden_states, target, loss_mask, input_ids = self._prepare_data(
-            input_ids, attention_mask, loss_mask
-        )
-
-        # basic info
-        batch_size, seq_length, _ = hidden_states.shape
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
-
-        # Step 2: project the concatenated hidden states to the target hidden size
-        hidden_states = self.draft_model.project_hidden_states(hidden_states)
-
-        # Step 3: process kv cache, position ids and position ids
-        if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
             device = hidden_states.device
             position_ids = torch.arange(
@@ -171,93 +350,8 @@ class OnlineEagle3Model(Eagle3Model):
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
-
-        # Step 4: handle attention mask
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-        attention_mask = self.draft_model.prepare_decoder_attention_mask(
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-            batch_size=batch_size,
-            seq_length=seq_length,
-            past_key_values_length=past_key_values_length,
-        )
-
-        # Step 5: run TTT
-        plosses = []
-        vlosses = []
-        acces = []
-        cache_hidden = [[], []]
-
-        for idx in range(self.length):
-            is_last = idx == self.length - 1
-
-            # Step 5.1: embed the input ids
-            inputs_embeds = self.draft_model.embed_input_ids(input_ids)
-            inputs_embeds = inputs_embeds.to(hidden_states.dtype)
-
-            # Step 5.2: run the draft model backbone
-            hidden_states_out = self.draft_model.backbone(
-                input_embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                cache_hidden=cache_hidden,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=True,
-            )
-
-            # Step 5.3: handle vocab size
-            with torch.no_grad():
-                target_head = target
-                target_max_token = target_head.argmax(-1)
-                target_mask = self.draft_model.t2d[target_max_token]
-                target_mask = target_mask[..., None].int()
-                position_mask = target_mask * loss_mask
-                target_head = target_head[..., self.draft_model.t2d]
-                target_head = target_head.float()
-                target_p = nn.Softmax(dim=2)(target_head)
-                target_p = target_p.detach()
-
-            # update hidden states for next step
-            hidden_states = hidden_states_out
-
-            # Step 5.4: get logits
-            logits = self.draft_model.compute_logits(hidden_states)
-            logits = logits.float()
-
-            # Step 5.5: calculate loss
-            out_logp = nn.LogSoftmax(dim=2)(logits)
-            plogp = target_p * out_logp
-            loss = -torch.sum(position_mask * plogp, 2).mean()
-
-            # Step 5.6: record metrics
-            plosses.append(loss)
-            with torch.no_grad():
-                acces.append(
-                    (
-                        (logits.argmax(-1) == target_p.argmax(-1))
-                        * position_mask.squeeze(-1)
-                    )
-                    .sum()
-                    .item()
-                    / (loss_mask.sum().item() + 1e-6)
-                )
-
-            if not is_last:
-                # Step 5.7: we need to update the loss mask
-                input_ids = padding(input_ids, left=False)
-                target = padding(target, left=False)
-                loss_mask = padding(loss_mask, left=False)
-                ind = torch.arange(seq_length, device=attention_mask.device)
-                ind0 = ind[idx:]
-                ind1 = ind[: seq_length - idx]
-                attention_mask[:, :, ind0, ind1] = torch.finfo(attention_mask.dtype).min
-        return plosses, vlosses, acces
-
+        
+        return position_ids
 
 class OfflineEagle3Model(Eagle3Model):
     """
@@ -415,17 +509,14 @@ class OfflineEagle3Model(Eagle3Model):
                 attention_mask[:, :, ind0, ind1] = torch.finfo(attention_mask.dtype).min
         return plosses, vlosses, acces
 
-class OnlineEagle3VlmModel(Eagle3Model):
+class QwenVLOnlineEagle3Model(BaseOnlineEagle3Model):
     """
-    In sgl-spec, we implement offline/online training.
-    Online training means we have the target hidden_states available during training.
-    Eagle3 using test time training technique (TTT) to train the draft model.
-    1. We first extract the hidden states from the target model.
-    2. Then concatenate the hidden states from 3 aux layers (layer 1, layer num_layers//2, layer num_layers-4).
-    3. We project the concatenated hidden states to the target hidden size. from (batch, seq_len, 3*hidden_size) to (batch, seq_len, hidden_size)
-    4. We concat the projected hidden states and embedding output as the input for the draft model.
-    5. finally, we run TTT to train the draft model. input size is (batch, seq_len, hidden_size * 2)
-    """
+    Qwen-VL Online Eagle3 Model.
+    Difference:
+    1. Prepare data extract image features from the target model and concatenate them with the input embeddings.
+    2. Forward use input embeddings instead of input ids.
+    3. Got position ids for mrope, qwen-vl use mrope.
+    """  
 
     def __init__(self, target_model, draft_model: Eagle3DraftModel, processor, length: int = 7):
         """
@@ -434,12 +525,9 @@ class OnlineEagle3VlmModel(Eagle3Model):
             draft_model: the draft model to be trained.
             length: TTT length, it means how many turns to unroll during TTT.
         """
-        super().__init__()
-        self.target_model = target_model
-        self.draft_model = draft_model
+        super().__init__(target_model, draft_model, length)
         self.processor = processor
-        self.length = length
-
+    
     @torch.no_grad()
     def _prepare_data(
         self,
@@ -449,24 +537,9 @@ class OnlineEagle3VlmModel(Eagle3Model):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         device: Optional[torch.device] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
-        modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L692
-        Extract the hidden states from the target model outputs.
-
-        Args:
-            input_ids: (batch, seq_len)
-            attention_mask: (batch, seq_len)
-            loss_mask: (batch, seq_len)
-            device: the device to run the target model, if None, use the input_ids device
-            pixel_values: image pixel values, used for VLM models
-            image_grid_thw: image grid thw, used for VLM models
-
-        Returns:
-            hidden_states: (batch, seq_len, 3*hidden_size)
-            target: (batch, seq_len, vocab_size)
-            loss_mask: (batch, seq_len)
-            input_ids: (batch, seq_len)
+        Extract the hidden states from the target model outputs and get input embeddings with image features.
         """
 
         if device is None:
@@ -482,7 +555,6 @@ class OnlineEagle3VlmModel(Eagle3Model):
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
             )
-
         mask = input_ids == self.target_model.model.config.image_token_id
         mask_unsqueezed = mask.unsqueeze(-1)
         mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
@@ -502,24 +574,7 @@ class OnlineEagle3VlmModel(Eagle3Model):
         )
 
         # extract the aux hidden states
-        # output_hidden_states = True will return the embedding output as well
-        # so we have an offset of 1
-        num_hidden_states = len(outputs.hidden_states)
-        offset = 1
-        num_layers = num_hidden_states - 1
-
-        # Eagle3 uses 3 aux layers from layer 1, num_layers//2, num_layers-4
-        low_aux_layer = 1 + offset
-        mid_aux_layer = num_layers // 2 - 1 + offset
-        last_aux_layer = num_layers - 4 + offset
-
-        hidden_states0 = outputs.hidden_states[low_aux_layer]
-        hidden_states1 = outputs.hidden_states[mid_aux_layer]
-        hidden_states2 = outputs.hidden_states[last_aux_layer]
-
-        hidden_states = torch.cat(
-            (hidden_states0, hidden_states1, hidden_states2), dim=-1
-        )
+        hidden_states = self._extract_aux_hidden_states(outputs)
 
         # apply pading
         target = outputs.logits
@@ -533,65 +588,29 @@ class OnlineEagle3VlmModel(Eagle3Model):
 
         return hidden_states, target, loss_mask, input_ids, inputs_embeds
 
-    def forward(
+    def _get_position_ids(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        loss_mask: torch.Tensor,
-        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        hidden_states: torch.Tensor,
+        past_key_values_length: int,
+        seq_length: int,
         position_ids: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        **kwargs
+    ) -> torch.Tensor:
         """
-        Online eagle model trainer, modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L711
-
-        Args:
-            input_ids: (batch, seq_len)
-            attention_mask: (batch, seq_len)
-            loss_mask: (batch, seq_len)
-            past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
-            position_ids: (batch, seq_len)
+        get position ids for mrope.
         """
-        # Step 1: prepare data with the target model
-        hidden_states, target, loss_mask, input_ids, pre_inputs_embeds = self._prepare_data(
-            input_ids, attention_mask, loss_mask, pixel_values, image_grid_thw
-        )
-
-        # basic info
-        batch_size, seq_length, _ = hidden_states.shape
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
-
-        # Step 2: project the concatenated hidden states to the target hidden size
-        hidden_states = self.draft_model.project_hidden_states(hidden_states)
-
-        # Step 3: process kv cache, position ids and position ids
-        if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
-
-        # if position_ids is None:
-        #     device = hidden_states.device
-        #     position_ids = torch.arange(
-        #         past_key_values_length,
-        #         seq_length + past_key_values_length,
-        #         dtype=torch.long,
-        #         device=device,
-        #     )
-        #     position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-        # else:
-        #     position_ids = position_ids.view(-1, seq_length).long()
-
         if position_ids is None:
             attention_mask_tensor = (
-                attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
+                attention_mask if not isinstance(attention_mask, dict) 
+                else attention_mask["full_attention"]
             )
             if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
                 attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
                 attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
                 attention_mask_tensor = (1.0 - attention_mask_tensor).int()
-
 
             position_ids, rope_deltas = self.target_model.model.get_rope_index(
                 input_ids,
@@ -601,94 +620,270 @@ class OnlineEagle3VlmModel(Eagle3Model):
                 attention_mask=attention_mask_tensor,
             )
             self.rope_deltas = rope_deltas
-        else:
-            position_ids = position_ids
+        
+        return position_ids
 
-        # Step 4: handle attention mask
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-        attention_mask = self.draft_model.prepare_decoder_attention_mask(
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-            batch_size=batch_size,
-            seq_length=seq_length,
-            past_key_values_length=past_key_values_length,
-        )
+ 
 
-        # Step 5: run TTT
-        plosses = []
-        vlosses = []
-        acces = []
-        cache_hidden = [[], []]
 
-        for idx in range(self.length):
-            is_last = idx == self.length - 1
+# class OnlineEagle3VlmModel(Eagle3Model):
+#     """
+#     base on OnlineEagle3Model, support VLM models.
+#     Difference:
+#     1. Prepare data extract image features from the target model and concatenate them with the input embeddings.
+#     2. Forward use input embeddings instead of input ids.
+#     3. Got position ids for mrope
+#     """
 
-            # Step 5.1: embed the input ids
-            if pre_inputs_embeds is not None:
-                inputs_embeds = pre_inputs_embeds
-            else:
-                inputs_embeds = self.draft_model.embed_input_ids(input_ids)
-                inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+#     def __init__(self, target_model, draft_model: Eagle3DraftModel, processor, length: int = 7):
+#         """
+#         Args:
+#             target_model: the target model to extract hidden states.
+#             draft_model: the draft model to be trained.
+#             length: TTT length, it means how many turns to unroll during TTT.
+#         """
+#         super().__init__()
+#         self.target_model = target_model
+#         self.draft_model = draft_model
+#         self.processor = processor
+#         self.length = length
 
-            # Step 5.2: run the draft model backbone
-            hidden_states_out = self.draft_model.backbone(
-                input_embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                cache_hidden=cache_hidden,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=True,
-            )
+#     @torch.no_grad()
+#     def _prepare_data(
+#         self,
+#         input_ids: torch.Tensor,
+#         attention_mask: torch.Tensor,
+#         loss_mask: torch.Tensor,
+#         pixel_values: Optional[torch.Tensor] = None,
+#         image_grid_thw: Optional[torch.Tensor] = None,
+#         device: Optional[torch.device] = None
+#     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+#         """
+#         modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L692
+#         Extract the hidden states from the target model outputs.
 
-            # Step 5.3: handle vocab size
-            with torch.no_grad():
-                target_head = target
-                target_max_token = target_head.argmax(-1)
-                target_mask = self.draft_model.t2d[target_max_token]
-                target_mask = target_mask[..., None].int()
-                position_mask = target_mask * loss_mask
-                target_head = target_head[..., self.draft_model.t2d]
-                target_head = target_head.float()
-                target_p = nn.Softmax(dim=2)(target_head)
-                target_p = target_p.detach()
+#         Args:
+#             input_ids: (batch, seq_len)
+#             attention_mask: (batch, seq_len)
+#             loss_mask: (batch, seq_len)
+#             device: the device to run the target model, if None, use the input_ids device
+#             pixel_values: image pixel values, used for VLM models
+#             image_grid_thw: image grid thw, used for VLM models
 
-            # update hidden states for next step
-            hidden_states = hidden_states_out
+#         Returns:
+#             hidden_states: (batch, seq_len, 3*hidden_size)
+#             target: (batch, seq_len, vocab_size)
+#             loss_mask: (batch, seq_len)
+#             input_ids: (batch, seq_len)
+#         """
 
-            # Step 5.4: get logits
-            logits = self.draft_model.compute_logits(hidden_states)
-            logits = logits.float()
+#         if device is None:
+#             device = input_ids.device
 
-            # Step 5.5: calculate loss
-            out_logp = nn.LogSoftmax(dim=2)(logits)
-            plogp = target_p * out_logp
-            loss = -torch.sum(position_mask * plogp, 2).mean()
+#         # get input embeding with image
+#         inputs_embeds = self.target_model.model.get_input_embeddings()(input_ids)
+#         image_embeds = self.target_model.model.get_image_features(pixel_values, image_grid_thw)
+#         image_embeds = torch.cat(image_embeds, dim=0)
+#         n_image_tokens = (input_ids == self.target_model.model.config.image_token_id).sum()
+#         n_image_features = image_embeds.shape[0]
+#         if n_image_tokens != n_image_features:
+#             raise ValueError(
+#                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+#             )
+#         mask = input_ids == self.target_model.model.config.image_token_id
+#         mask_unsqueezed = mask.unsqueeze(-1)
+#         mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+#         image_mask = mask_expanded.to(inputs_embeds.device)
 
-            # Step 5.6: record metrics
-            plosses.append(loss)
-            with torch.no_grad():
-                acces.append(
-                    (
-                        (logits.argmax(-1) == target_p.argmax(-1))
-                        * position_mask.squeeze(-1)
-                    )
-                    .sum()
-                    .item()
-                    / (loss_mask.sum().item() + 1e-6)
-                )
+#         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+#         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-            if not is_last:
-                # Step 5.7: we need to update the loss mask
-                input_ids = padding(input_ids, left=False)
-                target = padding(target, left=False)
-                loss_mask = padding(loss_mask, left=False)
-                ind = torch.arange(seq_length, device=attention_mask.device)
-                ind0 = ind[idx:]
-                ind1 = ind[: seq_length - idx]
-                attention_mask[:, :, ind0, ind1] = torch.finfo(attention_mask.dtype).min
-        return plosses, vlosses, acces
+#         # run the target model to get the hidden states
+#         outputs = self.target_model(
+#             input_ids=input_ids,
+#             attention_mask=attention_mask,
+#             pixel_values=pixel_values,
+#             image_grid_thw=image_grid_thw,
+#             output_hidden_states=True,
+#             use_cache=False,
+#         )
+
+#         # extract the aux hidden states
+#         # output_hidden_states = True will return the embedding output as well
+#         # so we have an offset of 1
+#         num_hidden_states = len(outputs.hidden_states)
+#         offset = 1
+#         num_layers = num_hidden_states - 1
+
+#         # Eagle3 uses 3 aux layers from layer 1, num_layers//2, num_layers-4
+#         low_aux_layer = 1 + offset
+#         mid_aux_layer = num_layers // 2 - 1 + offset
+#         last_aux_layer = num_layers - 4 + offset
+
+#         hidden_states0 = outputs.hidden_states[low_aux_layer]
+#         hidden_states1 = outputs.hidden_states[mid_aux_layer]
+#         hidden_states2 = outputs.hidden_states[last_aux_layer]
+
+#         hidden_states = torch.cat(
+#             (hidden_states0, hidden_states1, hidden_states2), dim=-1
+#         )
+
+#         # apply pading
+#         target = outputs.logits
+#         target = padding(target, left=False)
+#         input_ids = padding(input_ids, left=False)
+
+#         if target is not None:
+#             target = target.to(device)
+#             loss_mask = loss_mask[..., None]
+#             loss_mask = loss_mask.to(device)
+
+#         return hidden_states, target, loss_mask, input_ids, inputs_embeds
+
+#     def forward(
+#         self,
+#         input_ids: torch.Tensor,
+#         attention_mask: torch.Tensor,
+#         loss_mask: torch.Tensor,
+#         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+#         position_ids: Optional[torch.Tensor] = None,
+#         pixel_values: Optional[torch.Tensor] = None,
+#         image_grid_thw: Optional[torch.Tensor] = None,
+#     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+#         """
+#         Online eagle model trainer, modified from: https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py#L711
+
+#         Args:
+#             input_ids: (batch, seq_len)
+#             attention_mask: (batch, seq_len)
+#             loss_mask: (batch, seq_len)
+#             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
+#             position_ids: (batch, seq_len)
+#         """
+#         # Step 1: prepare data with the target model
+#         hidden_states, target, loss_mask, input_ids, pre_inputs_embeds = self._prepare_data(
+#             input_ids, attention_mask, loss_mask, pixel_values, image_grid_thw
+#         )
+
+#         # basic info
+#         batch_size, seq_length, _ = hidden_states.shape
+#         seq_length_with_past = seq_length
+#         past_key_values_length = 0
+
+#         # Step 2: project the concatenated hidden states to the target hidden size
+#         hidden_states = self.draft_model.project_hidden_states(hidden_states)
+
+#         # Step 3: process kv cache, position ids and position ids
+#         if past_key_values is not None:
+#             past_key_values_length = past_key_values[0][0].shape[2]
+#             seq_length_with_past = seq_length_with_past + past_key_values_length
+
+#         if position_ids is None:
+#             attention_mask_tensor = (
+#                 attention_mask if not isinstance(attention_mask, dict) else attention_mask["full_attention"]
+#             )
+#             if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
+#                 attention_mask_tensor = torch.diagonal(attention_mask_tensor[:, 0], dim1=1, dim2=2)
+#                 attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+#                 attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+
+
+#             position_ids, rope_deltas = self.target_model.model.get_rope_index(
+#                 input_ids,
+#                 image_grid_thw,
+#                 None,
+#                 second_per_grid_ts=None,
+#                 attention_mask=attention_mask_tensor,
+#             )
+#             self.rope_deltas = rope_deltas
+#         else:
+#             position_ids = position_ids
+
+#         # Step 4: handle attention mask
+#         if attention_mask is None:
+#             attention_mask = torch.ones(
+#                 (batch_size, seq_length_with_past),
+#                 dtype=torch.bool,
+#                 device=hidden_states.device,
+#             )
+#         attention_mask = self.draft_model.prepare_decoder_attention_mask(
+#             attention_mask=attention_mask,
+#             hidden_states=hidden_states,
+#             batch_size=batch_size,
+#             seq_length=seq_length,
+#             past_key_values_length=past_key_values_length,
+#         )
+
+#         # Step 5: run TTT
+#         plosses = []
+#         vlosses = []
+#         acces = []
+#         cache_hidden = [[], []]
+
+#         for idx in range(self.length):
+#             is_last = idx == self.length - 1
+
+#             # Step 5.1: embed the input ids
+#             if pre_inputs_embeds is not None:
+#                 inputs_embeds = pre_inputs_embeds
+#             else:
+#                 inputs_embeds = self.draft_model.embed_input_ids(input_ids)
+#                 inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+
+#             # Step 5.2: run the draft model backbone
+#             hidden_states_out = self.draft_model.backbone(
+#                 input_embeds=inputs_embeds,
+#                 hidden_states=hidden_states,
+#                 cache_hidden=cache_hidden,
+#                 attention_mask=attention_mask,
+#                 position_ids=position_ids,
+#                 use_cache=True,
+#             )
+
+#             # Step 5.3: handle vocab size
+#             with torch.no_grad():
+#                 target_head = target
+#                 target_max_token = target_head.argmax(-1)
+#                 target_mask = self.draft_model.t2d[target_max_token]
+#                 target_mask = target_mask[..., None].int()
+#                 position_mask = target_mask * loss_mask
+#                 target_head = target_head[..., self.draft_model.t2d]
+#                 target_head = target_head.float()
+#                 target_p = nn.Softmax(dim=2)(target_head)
+#                 target_p = target_p.detach()
+
+#             # update hidden states for next step
+#             hidden_states = hidden_states_out
+
+#             # Step 5.4: get logits
+#             logits = self.draft_model.compute_logits(hidden_states)
+#             logits = logits.float()
+
+#             # Step 5.5: calculate loss
+#             out_logp = nn.LogSoftmax(dim=2)(logits)
+#             plogp = target_p * out_logp
+#             loss = -torch.sum(position_mask * plogp, 2).mean()
+
+#             # Step 5.6: record metrics
+#             plosses.append(loss)
+#             with torch.no_grad():
+#                 acces.append(
+#                     (
+#                         (logits.argmax(-1) == target_p.argmax(-1))
+#                         * position_mask.squeeze(-1)
+#                     )
+#                     .sum()
+#                     .item()
+#                     / (loss_mask.sum().item() + 1e-6)
+#                 )
+
+#             if not is_last:
+#                 # Step 5.7: we need to update the loss mask
+#                 input_ids = padding(input_ids, left=False)
+#                 target = padding(target, left=False)
+#                 loss_mask = padding(loss_mask, left=False)
+#                 ind = torch.arange(seq_length, device=attention_mask.device)
+#                 ind0 = ind[idx:]
+#                 ind1 = ind[: seq_length - idx]
+#                 attention_mask[:, :, ind0, ind1] = torch.finfo(attention_mask.dtype).min
+#         return plosses, vlosses, acces

@@ -4,6 +4,7 @@ import os
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 import wandb
 from accelerate.utils import set_seed
 from datasets import load_dataset
@@ -17,7 +18,7 @@ from specforge import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
     OnlineEagle3Model,
-    OnlineEagle3VlmModel,
+    QwenVLOnlineEagle3Model,
 )
 from specforge.data import (
     build_eagle3_dataset,
@@ -179,7 +180,6 @@ def main():
     # convert to dataloader
     cache_key = hashlib.md5(args.train_data_path.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    # train_dataset = train_dataset.shuffle(seed=args.seed).select(range(20000))
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -213,12 +213,15 @@ def main():
     print_with_rank(f"Loaded vocab mapping")
 
     if args.eval_data_path is not None:
+        eval_cache_key = hashlib.md5(args.eval_data_path.encode()).hexdigest()
         eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
         eval_eagle3_dataset = build_eagle3_dataset(
             eval_dataset,
             tokenizer,
             args.chat_template,
             args.max_length,
+            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+            cache_key=eval_cache_key,
             is_vlm=args.is_vlm,
             processor=processor,
             num_proc=16
@@ -229,13 +232,14 @@ def main():
             num_workers=4,
             shuffle=False,
             process_group=get_dp_group(),
+            is_vlm=args.is_vlm
         )
         print_with_rank(f"Initialized eval dataloader")
 
     # build Eagle3 model
     # broadcast draft model
     if args.is_vlm:
-        eagle3_model = OnlineEagle3VlmModel(
+        eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
             draft_model=draft_model,
             processor=processor,
@@ -372,6 +376,14 @@ def main():
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
                 )
+
+                eval_logdict = {}
+                for i in range(len(plosses)):
+                    eval_logdict[f"train/ploss_{i}"] = plosses[i].item()
+                for i in range(len(acces)):
+                    eval_logdict[f"train/acc_{i}"] = acces[i]
+                wandb_log_if_initialized(eval_logdict)
+
                 eval_acces = [eval_acces[i] + [acces[i]] for i in range(len(acces))]
                 eval_plosses = [
                     eval_plosses[i] + [plosses[i].item()] for i in range(len(plosses))
@@ -440,4 +452,5 @@ def main():
 
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
     main()

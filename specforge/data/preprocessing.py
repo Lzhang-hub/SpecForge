@@ -346,7 +346,6 @@ def build_eagle3_dataset(
         num_proc=num_proc,
         batch_size=batch_size,
         remove_columns=original_cols,
-        # keep_in_memory=True,
         load_from_cache_file=load_from_cache_file,
         cache_file_name=cache_file_name,
     )
