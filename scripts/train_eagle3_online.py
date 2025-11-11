@@ -241,19 +241,45 @@ def build_target_model(
     """
     if (
         args.is_vlm
-        and draft_model_config.target_model_type == "qwen2_5_vl"
+        and draft_model_config.target_model_type in {
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        }
         and args.tp_size == 1
     ):
-        from transformers import Qwen2_5_VLForConditionalGeneration
+        if draft_model_config.target_model_type == "qwen2_5_vl":
+            from transformers import Qwen2_5_VLForConditionalGeneration
 
-        target_model = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                pretrained_model_name_or_path=args.target_model_path,
-                torch_dtype=torch.bfloat16,
+            target_model = (
+                Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    torch_dtype=torch.bfloat16,
+                )
+                .eval()
+                .cuda()
             )
-            .eval()
-            .cuda()
-        )
+        elif draft_model_config.target_model_type == "qwen3_vl":
+            from transformers import Qwen3VLForConditionalGeneration
+            target_model = (
+                Qwen3VLForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    dtype=torch.bfloat16,
+                )
+                .eval()
+                .cuda()
+            )
+        elif draft_model_config.target_model_type == "qwen3_vl_moe":
+            from transformers import Qwen3VLMoeForConditionalGeneration
+
+            target_model = (
+                Qwen3VLMoeForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path=args.target_model_path,
+                    dtype=torch.bfloat16,
+                )
+                .eval()
+                .cuda()
+            )
     else:
         target_model = get_eagle3_target_model(
             pretrained_model_name_or_path=args.target_model_path,
@@ -598,7 +624,11 @@ def main():
     # ================================================
     if (
         args.is_vlm
-        and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
+        and getattr(draft_model_config, "target_model_type", None) in {
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        }
     ):
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
@@ -606,6 +636,7 @@ def main():
             processor=processor,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
+            target_model_type=draft_model_config.target_model_type,
         )
     else:
         eagle3_model = OnlineEagle3Model(

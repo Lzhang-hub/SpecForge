@@ -295,6 +295,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         processor,
         length: int = 7,
         attention_backend: str = "sdpa",
+        target_model_type: Optional[str] = None,
     ):
         """
         Args:
@@ -308,6 +309,13 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         self.processor = processor
         self.length = length
         self.attention_backend = attention_backend
+        if target_model_type is not None:
+            model_type = target_model_type
+        else:
+            target_config = getattr(target_model, "config", None)
+            model_type = getattr(target_config, "model_type", None)
+        self.target_model_type = model_type
+        self.rope_deltas: Optional[torch.Tensor] = None
 
     @torch.no_grad()
     def _prepare_data(
@@ -393,9 +401,13 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         # get input embeding with image
         # inputs_embeds = self.target_model.model.get_input_embeddings()(input_ids)
         inputs_embeds = self.draft_model.embed_input_ids(input_ids)
-        image_embeds = self.target_model.model.get_image_features(
+        image_features = self.target_model.model.get_image_features(
             pixel_values, image_grid_thw
         )
+        if self.target_model_type in {"qwen3_vl", "qwen3_vl_moe"}:
+            image_embeds, *_ = image_features
+        else:
+            image_embeds = image_features
         image_embeds = torch.cat(image_embeds, dim=0)
         n_image_tokens = (
             input_ids == self.target_model.model.config.image_token_id
